@@ -3,7 +3,7 @@ name: Test
 on:
   push:
     branches:
-      - master
+      - test
   pull_request:
 
 permissions:
