@@ -10,6 +10,7 @@ on:
     branches:
       - main
       - master
+      - test
     tags:
       # 只有严格的版本号 tag 才触发构建与 PyPI 发布，
       # 避免测试/拼错 tag 误发正式包
