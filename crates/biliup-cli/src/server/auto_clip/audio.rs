@@ -512,10 +512,12 @@ size= 1kB time=00:00:30.00
         assert_eq!(to_segment_ms(&spans, 2_000), 10_000);
         assert_eq!(to_segment_ms(&spans, 2_500), 10_500);
         assert_eq!(to_segment_ms(&spans, 9_999), 11_000, "越界取最后一段的末尾");
-        // 跨拼接点时 to 限制在 from 所在区间内，不落到下一个区间
+        // 跨拼接点时 to 限制在 from 所在区间内，不落到下一个区间。
+        // 块内时间 0–2000 对应段内 1000–3000，块内 2000–3000 对应段内 10000–11000。
         assert_eq!(to_segment_ms_clamped(&spans, 1_000, 2_999), 3_000);
-        assert_eq!(to_segment_ms_clamped(&spans, 1_000, 10_500), 3_000);
-        assert_eq!(to_segment_ms_clamped(&spans, 10_000, 10_500), 10_500);
+        assert_eq!(to_segment_ms_clamped(&spans, 1_999, 2_999), 3_000);
+        assert_eq!(to_segment_ms_clamped(&spans, 2_000, 2_999), 10_999);
+        assert_eq!(to_segment_ms_clamped(&spans, 2_000, 3_000), 11_000);
         assert_eq!(
             chunk_filter(&spans),
             "[0:a]asplit=2[s0][s1];\
