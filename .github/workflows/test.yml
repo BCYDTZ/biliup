@@ -46,18 +46,41 @@ jobs:
         run: |
           ffmpeg -version
           ffmpeg -hide_banner -encoders | head -n 20
-      - name: Debug select_filter and silencedetect on FFmpeg 8.0.1
+      - name: Debug FLV+AAC silencedetect on FFmpeg 8.0.1
         run: |
-          ffmpeg -y -f lavfi -i 'aevalsrc=0.4*sin(2*PI*440*t):s=16000:d=120' -ac 1 -c:a flac /tmp/full.flac 2>/dev/null
-          ffmpeg -hide_banner -nostats -loglevel error -i /tmp/full.flac \
-            -af "asetnsamples=n=160:p=0,aselect='between(n,0,6000)',asetpts=N/SR/TB" \
-            -ac 1 -ar 16000 -c:a flac -f flac -y /tmp/half.flac
-          echo -n "half.flac duration: "
-          ffprobe -v error -show_entries format=duration -of csv=p=0 /tmp/half.flac
-          ffmpeg -y -f lavfi -i 'aevalsrc=0.4*sin(2*PI*440*t)*lt(mod(t\,20)\,8):s=44100:d=120' -c:a aac /tmp/a.m4a 2>/dev/null
-          ffmpeg -hide_banner -i /tmp/a.m4a \
-            -af 'asetpts=N/SR/TB,aresample=16000,silencedetect=noise=-35dB:d=2' \
-            -f null - 2>&1 | grep silence || echo "no silence detected"         
+          set -x
+          echo "=== 1. 生成 FLV ==="
+          ffmpeg -y -hide_banner -loglevel error \
+            -f lavfi -i "color=c=gray:s=64x36:r=5:d=240" \
+            -f lavfi -i "aevalsrc=0.4*sin(2*PI*440*t)*(between(t\,0\,60)+between(t\,180\,240)):s=44100:d=240" \
+            -c:v libx264 -preset ultrafast -pix_fmt yuv420p -g 25 -keyint_min 25 -sc_threshold 0 \
+            -c:a aac -shortest /tmp/live.flv
+          echo "=== 2. silencedetect ==="
+          ffmpeg -hide_banner -i /tmp/live.flv -vn \
+            -af "asetpts=N/SR/TB,aresample=16000,silencedetect=noise=-35dB:d=2" \
+            -f null - 2>&1 | grep silence || echo "NO SILENCE DETECTED"
+          echo "=== 3. 静音段 RMS ==="
+          ffmpeg -hide_banner -i /tmp/live.flv -vn \
+            -af "atrim=start=90:end=100,astats=metadata=1:reset=0" \
+            -f null - 2>&1 | grep -E "RMS level|Peak level" | head -4
+          echo "=== 4. -aac_pns 0 重试 ==="
+          ffmpeg -y -hide_banner -loglevel error \
+            -f lavfi -i "color=c=gray:s=64x36:r=5:d=240" \
+            -f lavfi -i "aevalsrc=0.4*sin(2*PI*440*t)*(between(t\,0\,60)+between(t\,180\,240)):s=44100:d=240" \
+            -c:v libx264 -preset ultrafast -pix_fmt yuv420p -g 25 -keyint_min 25 -sc_threshold 0 \
+            -c:a aac -aac_pns 0 -aac_is 0 -aac_coder twoloop -shortest /tmp/live_pns.flv
+          ffmpeg -hide_banner -i /tmp/live_pns.flv -vn \
+            -af "asetpts=N/SR/TB,aresample=16000,silencedetect=noise=-35dB:d=2" \
+            -f null - 2>&1 | grep silence || echo "NO SILENCE WITH -aac_pns 0"
+          echo "=== 5. TS+PCM 对照 ==="
+          ffmpeg -y -hide_banner -loglevel error \
+            -f lavfi -i "color=c=gray:s=64x36:r=5:d=240" \
+            -f lavfi -i "aevalsrc=0.4*sin(2*PI*440*t)*(between(t\,0\,60)+between(t\,180\,240)):s=44100:d=240" \
+            -c:v libx264 -preset ultrafast -pix_fmt yuv420p -g 25 -keyint_min 25 -sc_threshold 0 \
+            -c:a pcm_s16le -shortest /tmp/live.ts
+          ffmpeg -hide_banner -i /tmp/live.ts -vn \
+            -af "asetpts=N/SR/TB,aresample=16000,silencedetect=noise=-35dB:d=2" \
+            -f null - 2>&1 | grep silence || echo "NO SILENCE IN TS+PCM"
       # 随包字体不进仓库：按固定 SHA-256 取回，缺字体时相关用例会跳过而不是真跑
       - name: Fetch render fonts
         run: |
