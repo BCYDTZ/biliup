@@ -1,13 +1,12 @@
 //! 抽音频、静音检测与切块。
 //!
 //! 每个分段单独交给 ffmpeg 解一遍：`asetpts=N/SR/TB` 把时间戳改成按采样数从 0 数，
-//! `silencedetect` 报的静音就是段内时间，不受分段里原始时间戳（stream-gears 的绝对时间戳、
-//! fMP4 保留的源站 `tfdt`）影响；段内时间 + `segments.start_ms` = 场次时间。同一趟输出
+//! `silencedetect` 报的静音就是段内时间，不受分段里原始时间戳（stream-gears 的绝对时间戳、fMP4 保留的源站 `tfdt`）影响；段内时间 + `segments.start_ms` = 场次时间。同一趟输出
 //! 16 kHz 单声道 FLAC。逐段处理，前后分段编码参数不同也互不影响。
 //!
 //! 切块：去掉 ≥ 2 s 的静音（两侧各留 0.3 s），剩下的语音区间按顺序合并成不超过 10 分钟
 //! （转写模型不给分句时间戳时 60 s）的一块，只在静音处切；一段语音本身超过上限就硬切，
-//! 前后重叠 1 s。每块从 FLAC 里按 10 ms 一帧选出自己的语音区间拼起来重新编码（16 kHz
+//! 前后重叠 1 s。每块从 FLAC 里按时间区间选出自己的语音拼起来重新编码（16 kHz
 //! 单声道 FLAC 解码很快，不再读录像），块内时间按区间表换算回段内时间。
 
 use crate::tools::low_priority_ffmpeg_command;
@@ -17,9 +16,8 @@ use std::path::Path;
 use std::process::Stdio;
 
 pub const SAMPLE_RATE: u32 = 16_000;
-/// 切块时选取音频的粒度：每帧 160 个采样
+/// 切块时按 10 ms 对齐（区间边界吸附到这个粒度）
 const FRAME_MS: i64 = 10;
-const FRAME_SAMPLES: i64 = SAMPLE_RATE as i64 * FRAME_MS / 1000;
 /// 能量低于 -35 dB 且持续 2 s 以上算静音。这是能量阈值，不是真正的人声检测：背景音乐、
 /// 游戏音效不会被当成静音。
 const SILENCE_FILTER: &str = "silencedetect=noise=-35dB:d=2";
@@ -166,7 +164,7 @@ pub async fn encode_chunk(source: &Path, spans: &[Span], out: &Path) -> Result<u
             "-i",
         ])
         .arg(source)
-        .args(["-af", &select_filter(spans)])
+        .args(["-filter_complex", &chunk_filter(spans), "-map", "[out]"])
         .args(["-ac", "1", "-ar", &SAMPLE_RATE.to_string()])
         .args(["-c:a", "flac", "-f", "flac", "-y"])
         .arg(out)
@@ -185,21 +183,38 @@ pub async fn encode_chunk(source: &Path, spans: &[Span], out: &Path) -> Result<u
     Ok(tokio::fs::metadata(out).await?.len())
 }
 
-/// 按 10 ms 一帧选出区间：先把音频切成每帧 160 个采样，再按帧号选，拼出来的时长与区间表
-/// 逐帧对得上，块内时间换算回段内时间不会随区间数累积误差。
-fn select_filter(spans: &[Span]) -> String {
-    let terms: Vec<String> = spans
-        .iter()
-        .map(|span| {
-            let first = span.from_ms / FRAME_MS;
-            let last = (span.to_ms / FRAME_MS - 1).max(first);
-            format!("between(n,{first},{last})")
-        })
-        .collect();
-    format!(
-        "asetnsamples=n={FRAME_SAMPLES}:p=0,aselect='{}',asetpts=N/SR/TB",
-        terms.join("+")
-    )
+/// 按 `spans` 选出音频：用 `atrim` 按时间裁剪再 `concat`，不依赖帧序号。
+///
+/// 旧实现用 `asetnsamples` + `aselect`，在 FFmpeg 8.0.1 下 `aselect` 不生效——
+/// `between(n,0,6000)` 没有截取任何帧，`encode_chunk` 输出始终是完整音频。表现为
+/// `an_oversized_upload_is_split_in_halves` 的 sizes 全等、`transcribes_mixed_segments_and_skips_silence`
+/// 的 `送转写` 等于整段时长之和。改用 `atrim` 后只依赖时间戳，跨版本一致。
+fn chunk_filter(spans: &[Span]) -> String {
+    if spans.len() == 1 {
+        let span = &spans[0];
+        return format!(
+            "[0:a]atrim=start={:.3}:end={:.3},asetpts=N/SR/TB[out]",
+            span.from_ms as f64 / 1000.0,
+            span.to_ms as f64 / 1000.0
+        );
+    }
+    let mut graph = String::new();
+    let labels: Vec<String> = (0..spans.len()).map(|i| format!("[s{i}]")).collect();
+    graph.push_str(&format!("[0:a]asplit={}{};", spans.len(), labels.join("")));
+    for (i, span) in spans.iter().enumerate() {
+        graph.push_str(&format!(
+            "[s{i}]atrim=start={:.3}:end={:.3},asetpts=N/SR/TB[a{i}];",
+            span.from_ms as f64 / 1000.0,
+            span.to_ms as f64 / 1000.0
+        ));
+    }
+    let inputs: Vec<String> = (0..spans.len()).map(|i| format!("[a{i}]")).collect();
+    graph.push_str(&format!(
+        "{}concat=n={}:v=0:a=1,asetpts=N/SR/TB[out]",
+        inputs.join(""),
+        spans.len()
+    ));
+    graph
 }
 
 async fn read_head(path: &Path) -> std::io::Result<Vec<u8>> {
@@ -478,8 +493,15 @@ size= 1kB time=00:00:30.00
         assert_eq!(to_segment_ms(&spans, 2_500), 10_500);
         assert_eq!(to_segment_ms(&spans, 9_999), 11_000, "越界取最后一段的末尾");
         assert_eq!(
-            select_filter(&spans),
-            "asetnsamples=n=160:p=0,aselect='between(n,100,299)+between(n,1000,1099)',asetpts=N/SR/TB"
+            chunk_filter(&spans),
+            "[0:a]asplit=2[s0][s1];\
+             [s0]atrim=start=1.000:end=3.000,asetpts=N/SR/TB[a0];\
+             [s1]atrim=start=10.000:end=11.000,asetpts=N/SR/TB[a1];\
+             [a0][a1]concat=n=2:v=0:a=1,asetpts=N/SR/TB[out]"
+        );
+        assert_eq!(
+            chunk_filter(&[Span::new(0, 5_000)]),
+            "[0:a]atrim=start=0.000:end=5.000,asetpts=N/SR/TB[out]"
         );
     }
 
