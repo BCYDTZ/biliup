@@ -418,6 +418,26 @@ pub fn to_segment_ms(spans: &[Span], chunk_ms: i64) -> i64 {
     spans.last().map_or(chunk_ms, |span| span.to_ms)
 }
 
+/// 块内时间换算回段内时间，但 `to_ms` 不跨越 `from_ms` 所在的区间。
+///
+/// chunk 把不连续的语音区间拼接在一起，转写模型的一句话可能跨越拼接点。
+/// 这时 `to_ms` 按 [`to_segment_ms`] 的逻辑会映射到下一个区间，导致一句话
+/// 覆盖两个区间之间的大段静音，让 `candidates::check` 的 `asr_lines` 把静音
+/// 误判为有语音（表现为 `suggestions_come_from_checked_and_snapped_replies`
+/// 里「编的」那条候选没被 `NoEvidence` 拒掉）。
+pub fn to_segment_ms_clamped(spans: &[Span], from_ms: i64, to_ms: i64) -> i64 {
+    let mut offset = 0;
+    for span in spans {
+        if from_ms < offset + span.len_ms() {
+            // from 落在这个 span：to 也限制在这个 span 内
+            let local_to = (to_ms - offset).max(0).min(span.len_ms());
+            return span.from_ms + local_to;
+        }
+        offset += span.len_ms();
+    }
+    spans.last().map_or(to_ms, |span| span.to_ms)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -492,6 +512,10 @@ size= 1kB time=00:00:30.00
         assert_eq!(to_segment_ms(&spans, 2_000), 10_000);
         assert_eq!(to_segment_ms(&spans, 2_500), 10_500);
         assert_eq!(to_segment_ms(&spans, 9_999), 11_000, "越界取最后一段的末尾");
+        // 跨拼接点时 to 限制在 from 所在区间内，不落到下一个区间
+        assert_eq!(to_segment_ms_clamped(&spans, 1_000, 2_999), 3_000);
+        assert_eq!(to_segment_ms_clamped(&spans, 1_000, 10_500), 3_000);
+        assert_eq!(to_segment_ms_clamped(&spans, 10_000, 10_500), 10_500);
         assert_eq!(
             chunk_filter(&spans),
             "[0:a]asplit=2[s0][s1];\
